@@ -167,6 +167,9 @@
   }
   .links a { border-color: var(--ink-2); box-shadow: 0 1px 0 var(--drop-2); }
   .links a:hover { background: var(--blue); }
+  .links a.try { background: var(--green); border-color: var(--ink); box-shadow: 1px 1.5px 0 var(--drop); color: var(--ink); }
+  .links a.try:hover { background: var(--green-2); }
+  .links a.try:active { box-shadow: none; transform: translate(.5px, 1px); }
   .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; font-size: 10px; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
   .meta span { padding: 1px 6px; border-radius: 999px; background: var(--sand); color: var(--ink-2); }
   .meta .risk-low { background: var(--mint); }
@@ -278,6 +281,8 @@
   .verdict.warn { background: var(--amber); }
   .verdict.stop { background: var(--red-soft); }
   .note { color: var(--muted); font-size: 12.5px; }
+  .shot { display: block; max-width: 100%; border: 1.5px solid var(--ink); border-radius: 10px; box-shadow: var(--pop-shadow); background: var(--white); }
+  .shot-cap { font-size: 11px; color: var(--muted); margin: 0 0 10px; }
   .md .summary {
     background: var(--violet); border: 1px solid color-mix(in srgb, var(--violet-ink) 25%, transparent); border-radius: 12px;
     padding: 12px 16px 4px; margin: 0 0 22px;
@@ -362,7 +367,7 @@
 <script>
 const POLL_MS = 2000
 const COLUMNS = [
-  { label: 'Intake', who: 'intake · fable', stages: ['intake', 'needs-info'] },
+  { label: 'Intake', who: 'intake · opus', stages: ['intake', 'needs-info'] },
   { label: 'Spec', who: 'spec-writer · opus', stages: ['spec'] },
   { label: 'Build', who: 'builder · gate', stages: ['build', 'gate'] },
   { label: 'Review', who: 'routed reviewers', stages: ['review'] },
@@ -448,6 +453,12 @@ const link = (url, text) =>
 function links(job) {
   const out = [link(job.issue_url, `issue #${job.issue}`)]
   if (job.pr) out.push(link(job.pr_url, `PR #${job.pr}`))
+  // factory/bin/frappe-sandbox writes sandbox.json while the job's sandbox site runs.
+  const sb = job.sandbox
+  if (sb?.running && sb.url) {
+    const login = sb.login ? `log in as ${sb.login.user} / ${sb.login.password}` : ''
+    out.push(`<a class="try" href="${esc(sb.url)}/login" target="_blank" rel="noopener" title="${esc(login)}">▶ try it</a>`)
+  }
   return out.join('')
 }
 
@@ -534,7 +545,11 @@ async function loadJobs() {
     .filter((h) => h.endsWith('/'))
     .map((h) => h.slice(0, -1))
     .sort()
-  return Promise.all(ids.map(async (id) => JSON.parse(await fetchText(`jobs/${id}/job.json`))))
+  return Promise.all(ids.map(async (id) => {
+    const job = JSON.parse(await fetchText(`jobs/${id}/job.json`))
+    try { job.sandbox = JSON.parse(await fetchText(`jobs/${id}/sandbox.json`)) } catch { job.sandbox = null }
+    return job
+  }))
 }
 
 // ---- Drawer --------------------------------------------------------------
@@ -546,7 +561,7 @@ async function listFiles(dir) {
   const out = []
   for (const h of hrefs) {
     if (h.endsWith('/')) out.push(...(await listFiles(dir + h)).map((f) => h + f))
-    else if (h.endsWith('.md')) out.push(h)
+    else if (h.endsWith('.md') || h.endsWith('.png')) out.push(h)
   }
   return out
 }
@@ -556,8 +571,11 @@ const ROUND_ORDER = ['checks', 'review-code', 'review-security', 'review-ux', 'r
 
 function fileRank(path) {
   if (ORDER.includes(path)) return [0, ORDER.indexOf(path), path]
-  const round = path.match(/^round-(\d+)\/(.+)\.md$/)
-  if (round) return [2, Number(round[1]) * 10 + ROUND_ORDER.indexOf(round[2]), path]
+  const round = path.match(/^round-(\d+)\/(.+)\.(md|png)$/)
+  if (round) {
+    const at = ROUND_ORDER.indexOf(round[2])
+    return [2, Number(round[1]) * 10 + (at === -1 ? 9 : at), path] // screenshots after the round's files
+  }
   return [1, 0, path] // intake-<k>.md, feedback-<k>.md
 }
 
@@ -588,12 +606,15 @@ async function refreshDrawer() {
   const files = sortFiles(await listFiles(base))
   if (!openPath || !files.includes(openPath)) openPath = files[0] || null
 
+  const isShot = (f) => f.endsWith('.png')
   let text = null
-  if (openPath) {
+  if (openPath && isShot(openPath)) {
+    text = `\u0000shot:${openPath}`
+  } else if (openPath) {
     text = await fetchText(base + openPath)
     firstLines.set(base + openPath, text.split('\n')[0].trim())
   }
-  await Promise.all(files.filter((f) => !firstLines.has(base + f)).map(async (f) => {
+  await Promise.all(files.filter((f) => !isShot(f) && !firstLines.has(base + f)).map(async (f) => {
     firstLines.set(base + f, (await fetchText(base + f)).split('\n')[0].trim())
   }))
 
@@ -604,7 +625,7 @@ async function refreshDrawer() {
     group = g
     const round = f.match(/^round-(\d+)\//)
     const name = round
-      ? `<span class="rn">R${round[1]} </span>${esc(f.split('/')[1].replace(/^review-|\.md$/g, ''))}`
+      ? `<span class="rn">R${round[1]} </span>${esc(f.split('/').slice(1).join('/').replace(/^review-|\.md$/g, ''))}`
       : esc(f)
     const t = tone(firstLines.get(base + f) || '')
     return `${head}<button class="file ${f === openPath ? 'on' : ''}" data-file="${esc(f)}">
@@ -613,7 +634,10 @@ async function refreshDrawer() {
 
   if (text !== openText) {
     openText = text
-    $('d-doc').innerHTML = text === null ? '<p class="note">Intake hasn’t written anything yet.</p>' : markdown(text)
+    $('d-doc').innerHTML = text === null ? '<p class="note">Intake hasn’t written anything yet.</p>'
+      : text.startsWith('\u0000shot:')
+        ? `<p class="shot-cap">${esc(openPath)}</p><img class="shot" src="${esc(base + openPath)}" alt="${esc(openPath)}">`
+        : markdown(text)
   }
 }
 

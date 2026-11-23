@@ -30,7 +30,7 @@ You need Claude Code 2.1.257 or later, `python3`, and an authenticated
 issues labeled `factory`
         │
         ▼
-intake (fable) ── NEEDS-INFO → asks the author on the issue, waits for a reply
+intake (opus) ─── NEEDS-INFO → asks the author on the issue, waits for a reply
         │         REJECT     → says why on the issue, removes the label
         ▼ ACCEPT, maybe rescoped; rates risk + surfaces
 route (script)    picks reviewers and models from config.json
@@ -63,13 +63,33 @@ You approve by merging the PR on GitHub. To change an escalated PR, tell the
 factory what you want with `/factory`. To drop a job that waits on you or on
 its author, tell the factory to reject it.
 
+## Frappe apps
+
+A Frappe app only runs inside a bench, so `profiles/frappe/` adds what the
+factory needs there. Each job gets a **sandbox**: a throwaway site copied from
+your preview site's database that runs the job's branch code, on its own port
+(`http://job004-<app>.localhost:5145`). The gate runs the Python tests and the
+browser (e2e) specs linked to the change there; agents sign in, try the flow
+and take screenshots. The dashboard
+shows the screenshots and a **▶ try it** button, so you can use the change
+yourself before merging. Mail is muted, the scheduler paused, background jobs
+run on the sandbox's own worker, and the sandbox is dropped when the job ends.
+
+- `profiles/frappe/bin/`: `frappe-sandbox` (create, run, drop a job's site),
+  `frappe-test` (pick and run the linked Python tests), `frappe-e2e` (pick and
+  run the linked Playwright specs against the sandbox), `ruff-new` (fail only
+  on new lint findings).
+- `profiles/frappe/agents/`: sections appended to the agents.
+- `profiles/frappe/examples/candy_wiki/`: a complete, tested configuration.
+- `profiles/frappe/HUONG-DAN-CAI.md`: the install guide (Vietnamese).
+
 ## Files
 
 ```
 .claude/
   skills/factory/SKILL.md     the orchestrator: queue, concurrency, the pipeline
   agents/
-    intake.md                 fable    worth building? at what scope? risk + surfaces
+    intake.md                 opus     worth building? at what scope? risk + surfaces
     spec-writer.md            opus     spec.md
     builder.md                opus     code, commits, the PR, build.md
     reviewer-code.md          routed   correctness, simplicity, tests
@@ -78,7 +98,7 @@ its author, tell the factory to reject it.
     reviewer-ui.md            haiku    only when intake flags `ui`
     approver.md               opus     APPROVE or ESCALATE
 factory/
-  config.json                 concurrency, rounds, labels, routing, protected paths, prices
+  config.json                 concurrency, rounds, labels, routing, protected paths, language, prices
   checks.sh                   your repo's checks (the installer fills it in)
   bin/job                     the only writer of job.json; refuses illegal moves; merges
   bin/gate                    runs checks.sh in a job's worktree → round-N/checks.md
@@ -126,8 +146,7 @@ They come from a test run on a small private calculator repo, with
 
 - It opens and merges real PRs and runs on your Claude plan. Start with
   `concurrency: 1` and read every PR until you trust it.
-- Intake runs on Fable once per issue. Depending on your plan, Fable can bill
-  to usage credits rather than your plan's included usage.
+- Intake runs on Opus at high effort, once per issue.
 - Only issues labeled `factory` run, and only people with triage or write
   access can add labels. Issue text reaches the agents as quoted data, never
   as their instructions.

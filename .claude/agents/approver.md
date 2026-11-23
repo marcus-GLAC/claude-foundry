@@ -54,6 +54,14 @@ ESCALATE if any of them fails, or if the change:
 
 Tailor these lists to the project: what must a human always see here?
 
+## Language
+
+The header's `Language:` is the language the human reads. Write the prose of
+decision.md (the factory posts it on the PR when it escalates) in it: summaries, reasons, criteria, findings and questions. Keep
+exactly as this file shows them, because scripts and the dashboard read them:
+the first line, the `KEY: value` lines under it and every `##` heading. Code,
+identifiers, commands, paths, branch names stay as the repo writes them.
+
 ## Write decision.md
 
 ```markdown

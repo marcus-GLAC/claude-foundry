@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""A throwaway Frappe site per factory job, running the job's branch code.
+
+Usage:
+  frappe-sandbox up <job> [--worktree PATH] [--number N] [--no-build] [--no-start]
+        create the site if it doesn't exist (a copy of the source site), build the
+        branch's assets, migrate when the branch changes the schema, start it, print its URL
+  frappe-sandbox refresh <job>     the same, even if it already runs this code: rebuild, migrate, restart
+        (`up` on a sandbox that already runs the worktree's current code only prints the URL)
+  frappe-sandbox down <job>        stop its web server, worker and port forwarder
+  frappe-sandbox drop <job>        down, then delete its site, database, queue and folder
+  frappe-sandbox status [<job>]    list sandboxes: URL, running or stopped
+  frappe-sandbox frappe <job> <args...>   run `frappe --site <sandbox site> <args>` with the branch code
+  frappe-sandbox py <job> < code.py       run Python on the sandbox site (frappe is imported and connected)
+
+<job> is a factory job id (its worktree comes from factory/jobs/<job>/job.json) or,
+with --worktree and --number, any name you choose. The first `up` remembers both.
+
+The site's database is a copy of `source_site` (factory/frappe.json), taken when the
+sandbox is created. Mail is muted, the scheduler paused and developer mode off. The
+branch code runs because the app is installed editable, so PYTHONPATH=<worktree> wins.
+Background jobs go to a Redis queue of the sandbox's own, served by its own worker.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+FACTORY = REPO / "factory"
+CFG = json.loads((FACTORY / "frappe.json").read_text())
+FACTORY_CFG = json.loads((FACTORY / "config.json").read_text())
+
+APP = CFG["app"]
+CONTAINER = CFG["container"]
+HOST_ROOT = Path(CFG["host_root"])
+CONTAINER_ROOT = CFG["container_root"]
+BENCH_HOST = Path(CFG["bench"])
+SOURCE = CFG.get("source_site", "preview.localhost")
+ROOT = Path(CFG.get("sandbox_root", str(BENCH_HOST.parent / ".factory-sandboxes"))) / APP
+DB_ROOT_PASSWORD = os.environ.get("DB_ROOT_PASSWORD") or CFG.get("db_root_password", "123")
+ADMIN_PASSWORD = CFG.get("admin_password", "admin")
+PORTS = FACTORY_CFG.get("ports", {"base": 5100, "step": 10})
+MIGRATE_PATTERNS = (r"/doctype/[^/]+/[^/]+\.json$", r"(^|/)hooks\.py$", r"(^|/)patches\.txt$", r"/patches/(?!.*test_)[^/]+\.py$")
+KEEP_SOURCE_CONFIG_OUT = {"db_name", "db_password", "db_user", "db_type", "host_name", "installed_apps"}
+
+
+def die(msg, code=2):
+    print(f"frappe-sandbox: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def cpath(host):
+    """The container's path for a host path under host_root."""
+    host = Path(host).resolve()
+    try:
+        return f"{CONTAINER_ROOT}/{host.relative_to(HOST_ROOT.resolve())}"
+    except ValueError:
+        die(f"{host} is outside {HOST_ROOT}, which the container can't see")
+
+
+BENCH = cpath(BENCH_HOST)
+
+
+def dexec(cmd, cwd=None, env=None, check=True, capture=False, stdin=None, detach=False):
+    """Run a shell command in the container as the frappe user."""
+    args = ["docker", "exec", "-u", "frappe"]
+    if stdin is not None:
+        args.append("-i")
+    if detach:
+        args.append("-d")
+    if cwd:
+        args += ["-w", cwd]
+    for k, v in (env or {}).items():
+        args += ["-e", f"{k}={v}"]
+    args += [CONTAINER, "bash", "-lc", cmd]
+    res = subprocess.run(args, input=stdin, text=True, capture_output=capture)
+    if check and res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()[-2000:] if capture else ""
+        die(f"failed in the container ({res.returncode}): {cmd}\n{detail}")
+    return res
+
+
+def container_ip():
+    out = subprocess.run(
+        ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", CONTAINER],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    return out[0]
+
+
+# ---- The sandbox -----------------------------------------------------------
+
+
+class Sandbox:
+    def __init__(self, name, worktree=None, number=None):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            die(f"bad sandbox name {name!r}")
+        self.name = name
+        self.dir = ROOT / name
+        self.state_file = self.dir / "state.json"
+        state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
+        job_file = FACTORY / "jobs" / name / "job.json"
+        if job_file.exists():
+            job = json.loads(job_file.read_text())
+            worktree = worktree or job["worktree"]
+            number = number if number is not None else int(name.split("-", 1)[0])
+        worktree = worktree or state.get("worktree")
+        if worktree is None and (self.dir / "apps" / APP).is_dir():
+            worktree = self.dir / "apps" / APP  # where config.json worktree_path puts a job's worktree
+        number = number if number is not None else state.get("number")
+        if worktree is None or number is None:
+            die(f"no job {name} in factory/jobs/ and no saved sandbox: pass --worktree and --number")
+        self.worktree = Path(worktree).resolve()
+        self.number = int(number)
+        self.state = state
+        slug = APP.replace("_", "-")
+        is_job = job_file.exists() or re.match(r"\d+-", name)
+        # a job's site is named by its number; another sandbox (main, base) by its name
+        self.site = state.get("site") or (f"job{self.number:03d}-{slug}.localhost" if is_job else f"{name}-{slug}.localhost")
+        self.port = PORTS["base"] + PORTS["step"] * self.number + 5
+        self.url = f"http://{self.site}:{self.port}"
+        self.redis_db = 2 + self.number % 14
+        self.sites = self.dir / "sites"
+        self.env = {"PYTHONPATH": cpath(self.worktree)}
+
+    # -- helpers
+
+    def save(self, **changes):
+        self.state.update(changes)
+        self.state.update(
+            name=self.name, worktree=str(self.worktree), number=self.number, site=self.site,
+            port=self.port, url=self.url, login={"user": "Administrator", "password": ADMIN_PASSWORD},
+        )
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps(self.state, indent=2) + "\n")
+        job_dir = FACTORY / "jobs" / self.name
+        if job_dir.is_dir():  # the dashboard reads this
+            (job_dir / "sandbox.json").write_text(json.dumps(
+                {k: self.state[k] for k in ("url", "login", "site", "running") if k in self.state}, indent=2) + "\n")
+
+    def port_owner(self):
+        """Another sandbox that runs on this sandbox's port (same number), if any."""
+        for f in ROOT.glob("*/state.json") if ROOT.exists() else []:
+            other = json.loads(f.read_text())
+            if other.get("name") != self.name and other.get("port") == self.port and other.get("running"):
+                return other["name"]
+        return None
+
+    def site_exists(self):
+        return (BENCH_HOST / "sites" / self.site / "site_config.json").exists()
+
+    def frappe(self, args, check=True, capture=False, stdin=None):
+        """`frappe --site <site> ...` with the branch code, from the sandbox's sites folder."""
+        cmd = f"{BENCH}/env/bin/python -m frappe.utils.bench_helper frappe --site {self.site} {args}"
+        return dexec(cmd, cwd=cpath(self.sites), env=self.env, check=check, capture=capture, stdin=stdin)
+
+    def py(self, code, check=True):
+        prelude = (
+            "import json, frappe\n"
+            f"frappe.init({self.site!r}, sites_path='.')\nfrappe.connect()\n"
+            f"SANDBOX = json.loads({json.dumps(json.dumps(self.state))})  # for setup and teardown scripts\n"
+        )
+        epilogue = "\nfrappe.db.commit()\nfrappe.destroy()\n"
+        return dexec(f"{BENCH}/env/bin/python -", cwd=cpath(self.sites), env=self.env,
+                     stdin=prelude + code + epilogue, check=check)
+
+    def git(self, *args):
+        res = subprocess.run(["git", *args], cwd=self.worktree, capture_output=True, text=True)
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    # -- create
+
+    def create_site(self):
+        print(f"→ copying {SOURCE} into {self.site} (a minute or two)", flush=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        src_cfg = json.loads((BENCH_HOST / "sites" / SOURCE / "site_config.json").read_text())
+        dump = cpath(self.dir) + "/source.sql"
+        dexec(f"mariadb-dump -h mariadb -uroot -p{shlex.quote(DB_ROOT_PASSWORD)} --single-transaction --quick "
+              f"{shlex.quote(src_cfg['db_name'])} > {dump}", cwd=BENCH)
+        try:
+            dexec(f"bench new-site {self.site} --db-root-password {shlex.quote(DB_ROOT_PASSWORD)} "
+                  f"--admin-password {shlex.quote(ADMIN_PASSWORD)} --source-sql {dump}", cwd=BENCH, capture=True)
+        finally:
+            (self.dir / "source.sql").unlink(missing_ok=True)
+        cfg_file = BENCH_HOST / "sites" / self.site / "site_config.json"
+        cfg = json.loads(cfg_file.read_text())
+        for key, value in src_cfg.items():  # the source's keys, so encrypted settings still decrypt
+            if key not in KEEP_SOURCE_CONFIG_OUT:
+                cfg[key] = value
+        cfg.update(
+            developer_mode=0, mute_emails=1, pause_scheduler=1, allow_tests=True,
+            host_name=self.url, throttle_user_limit=100000,
+            redis_queue=self.redis_url(),
+        )
+        cfg_file.write_text(json.dumps(cfg, indent=1) + "\n")
+        for sub in ("public/files", "private/files"):  # hard links: cheap, and new files stay apart
+            src, dst = BENCH_HOST / "sites" / SOURCE / sub, BENCH_HOST / "sites" / self.site / sub
+            if src.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+                subprocess.run(["cp", "-al", str(src), str(dst)], check=True)
+        self.save(created=time.strftime("%Y-%m-%d %H:%M"), source=SOURCE, migrated_commit=None)
+
+    def redis_url(self):
+        common = json.loads((BENCH_HOST / "sites" / "common_site_config.json").read_text())
+        base = common["redis_queue"].rsplit("/", 1)[0]
+        return f"{base}/{self.redis_db}"
+
+    def make_sites_dir(self):
+        """A sites folder of the sandbox's own: same bench, but /assets/<app> from the worktree."""
+        sites = self.sites
+        sites.mkdir(parents=True, exist_ok=True)
+        (self.dir / "logs").mkdir(exist_ok=True)
+        bench_sites = BENCH_HOST / "sites"
+        common = json.loads((bench_sites / "common_site_config.json").read_text())
+        common.update(redis_queue=self.redis_url(), developer_mode=0, live_reload=False)
+        (sites / "common_site_config.json").write_text(json.dumps(common, indent=1) + "\n")
+        for name in ("apps.txt", "apps.json"):
+            if (bench_sites / name).exists():
+                shutil.copy2(bench_sites / name, sites / name)
+        link(sites / self.site, bench_sites / self.site)
+        assets = sites / "assets"
+        assets.mkdir(exist_ok=True)
+        for entry in (bench_sites / "assets").iterdir():
+            target = assets / entry.name
+            if entry.name == APP:
+                link(target, self.worktree / APP / "public")
+            elif entry.is_symlink():
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                target.symlink_to(os.readlink(entry))  # container paths, as the bench has them
+            elif entry.is_file():
+                shutil.copy2(entry, target)
+            else:
+                link(target, entry)
+
+    # -- build and migrate
+
+    def prepare_worktree(self, build=True):
+        for rel in CFG.get("link_from_main", []):
+            dst = self.worktree / rel
+            if not dst.exists() and (REPO / rel).exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                link(dst, REPO / rel)
+        for rel in CFG.get("copy_from_main", []):
+            dst = self.worktree / rel
+            if not dst.exists() and (REPO / rel).exists():
+                shutil.copytree(REPO / rel, dst, symlinks=True)
+        if not build:
+            return
+        for step in CFG.get("build", []):
+            print(f"→ build: {step['run']} ({step.get('cwd', '.')})", flush=True)
+            log = cpath(self.dir) + "/logs/build.log"
+            res = dexec(f"{step['run']} > {log} 2>&1", cwd=cpath(self.worktree / step.get("cwd", ".")),
+                        env=self.env, check=False)
+            if res.returncode != 0:
+                tail = (self.dir / "logs" / "build.log").read_text().splitlines()[-30:]
+                die("build failed: " + step["run"] + "\n" + "\n".join(tail), code=1)
+
+    def needs_migrate(self):
+        """Always on a fresh copy (the source site may run other code); then when the schema changed."""
+        last = self.state.get("migrated_commit")
+        if not last or self.git("cat-file", "-e", f"{last}^{{commit}}") is None:
+            return True
+        changed = (self.git("diff", "--name-only", last, "HEAD") or "").splitlines()
+        changed += (self.git("diff", "--name-only", "HEAD") or "").splitlines()  # uncommitted work too
+        return any(re.search(p, f) for p in MIGRATE_PATTERNS for f in changed)
+
+    def migrate(self, force=False):
+        if force or self.needs_migrate():
+            print(f"→ migrate {self.site} with the branch code", flush=True)
+            res = self.frappe("migrate", check=False, capture=True)
+            if res.returncode != 0:
+                die("migrate failed:\n" + "\n".join((res.stdout + res.stderr).splitlines()[-30:]), code=1)
+        self.save(migrated_commit=self.git("rev-parse", "HEAD"))
+
+    # -- run
+
+    def start(self):
+        self.stop(quiet=True)
+        logs = cpath(self.dir) + "/logs"
+        base = f"{BENCH}/env/bin/python -m frappe.utils.bench_helper frappe"
+        # `stop` finds both processes by their `--site <site> serve|worker` arguments.
+        dexec(f"exec {base} --site {self.site} serve --port {self.port} --noreload "
+              f">> {logs}/web.log 2>&1", cwd=cpath(self.sites), env=self.env, detach=True)
+        dexec(f"exec {base} --site {self.site} worker --queue short,default,long "
+              f">> {logs}/worker.log 2>&1", cwd=cpath(self.sites), env=self.env, detach=True)
+        log = open(self.dir / "logs" / "forward.log", "a")
+        fwd = subprocess.Popen([sys.executable, __file__, "_forward", str(self.port)],
+                               stdout=log, stderr=log, start_new_session=True)
+        self.save(forwarder_pid=fwd.pid)  # before waiting, so a failed start still stops it
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if self.answers():
+                break
+            time.sleep(2)
+        else:
+            die(f"the sandbox didn't answer on port {self.port}; see {self.dir}/logs/web.log", code=1)
+        self.save(running=True, forwarder_pid=fwd.pid)
+
+    def stop(self, quiet=False):
+        for kind in ("serve", "worker"):
+            dexec(f"pkill -f -- '--site {self.site} {kind}' || true", check=False)
+        pid = self.state.get("forwarder_pid")
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        # and any forwarder for this port that an interrupted run left behind, unless it's another's
+        if not self.port_owner():
+            subprocess.run(["pkill", "-f", f"frappe-sandbox _forward {self.port}$"], check=False)
+        if self.state_file.exists():
+            self.save(running=False, forwarder_pid=None)
+        if not quiet:
+            print(f"stopped {self.name}")
+
+    def drop(self):
+        if self.state_file.exists() or self.dir.exists():
+            self.stop(quiet=True)
+        teardown = CFG.get("teardown")
+        if teardown and self.site_exists():
+            self.make_sites_dir()
+            self.py((REPO / teardown).read_text(), check=False)
+        if self.site_exists():
+            # --archived-sites-path: drop-site keeps the site folder; keep it in ours, deleted below
+            dexec(f"bench drop-site {self.site} --force --no-backup --db-root-password {shlex.quote(DB_ROOT_PASSWORD)} "
+                  f"--archived-sites-path {cpath(self.dir)}/archived", cwd=BENCH, capture=True)
+        dexec(f"{BENCH}/env/bin/python -c \"import redis; redis.from_url('{self.redis_url()}').flushdb()\"", check=False)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        (FACTORY / "jobs" / self.name / "sandbox.json").unlink(missing_ok=True)
+        print(f"dropped {self.name} ({self.site})")
+
+    def answers(self):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/method/ping")
+            return urllib.request.urlopen(req, timeout=5).status == 200
+        except Exception:
+            return False
+
+    def code_version(self):
+        """HEAD plus a digest of uncommitted changes: what the sandbox was built from."""
+        diff = subprocess.run(["git", "diff", "HEAD"], cwd=self.worktree, capture_output=True).stdout
+        head = self.git("rev-parse", "HEAD")
+        return f"{head}+{hashlib.sha1(diff).hexdigest()[:10]}" if diff else head
+
+    def up(self, build=True, start=True, force=False):
+        if not self.worktree.is_dir():
+            die(f"worktree {self.worktree} doesn't exist")
+        owner = self.port_owner() if start else None
+        if owner:  # same number: its server would answer for this one, and tests would hit its site
+            die(f"sandbox {owner} runs on port {self.port}; stop it first: frappe-sandbox down {owner}", code=1)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with open(self.dir / ".up.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # the builder, reviewers and gate share one sandbox
+            self.state = json.loads(self.state_file.read_text()) if self.state_file.exists() else self.state
+            if (not force and start and self.state.get("running") and self.answers()
+                    and self.state.get("built") == self.code_version()):
+                print(f"{self.url}  (already running this code; login {self.state['login']['user']} / {ADMIN_PASSWORD})")
+                return
+            self._up(build, start)
+
+    def _up(self, build, start):
+        if not self.site_exists():
+            self.create_site()
+        self.make_sites_dir()
+        self.prepare_worktree(build=build)
+        if CFG.get("setup") and not self.state.get("setup_done"):
+            print("→ sandbox setup", flush=True)
+            self.save()
+            self.py((REPO / CFG["setup"]).read_text())
+            self.save(setup_done=True)
+        self.migrate()
+        if start:
+            self.start()
+            self.save(built=self.code_version() if build else self.state.get("built"))
+            print(f"{self.url}  (login {self.state['login']['user']} / {ADMIN_PASSWORD})")
+        else:
+            self.save()
+
+
+def link(path, target):
+    """A relative symlink, so it resolves on the host and in the container alike."""
+    path = Path(path)
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    path.symlink_to(os.path.relpath(Path(target).resolve(), path.parent.resolve()))
+
+
+# ---- Port forwarding (host → container), like preview-forward.py --------------
+
+
+def forward(port):
+    import asyncio
+
+    async def pipe(reader, writer):
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            writer.close()
+
+    async def handle(client_r, client_w):
+        try:
+            up_r, up_w = await asyncio.open_connection(container_ip(), port)
+        except OSError:
+            client_w.close()
+            return
+        await asyncio.gather(pipe(client_r, up_w), pipe(up_r, client_w))
+
+    async def main():
+        server = await asyncio.start_server(handle, "127.0.0.1", port)
+        await server.serve_forever()
+
+    asyncio.run(main())
+
+
+# ---- CLI ---------------------------------------------------------------------
+
+
+def status(names):
+    rows = []
+    for d in sorted(ROOT.glob("*/state.json")) if ROOT.exists() else []:
+        s = json.loads(d.read_text())
+        if names and s["name"] not in names:
+            continue
+        rows.append(f"{s['name']:<32} {'running' if s.get('running') else 'stopped':<8} {s['url']}")
+    print("\n".join(rows) or "no sandboxes")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "_forward":
+        return forward(int(rest[0]))
+    if cmd == "status":
+        return status(rest)
+    if not rest:
+        die(__doc__.strip())
+    name, rest = rest[0], rest[1:]
+    if cmd == "frappe":
+        sys.exit(Sandbox(name).frappe(shlex.join(rest), check=False).returncode)
+    if cmd == "py":
+        sys.exit(Sandbox(name).py(sys.stdin.read(), check=False).returncode)
+    opts = {"worktree": None, "number": None}
+    flags = set()
+    it = iter(rest)
+    for arg in it:
+        if arg in ("--worktree", "--number"):
+            opts[arg[2:]] = next(it, None)
+        elif arg in ("--no-build", "--no-start"):
+            flags.add(arg)
+        else:
+            die(f"unknown option {arg}")
+    sb = Sandbox(name, opts["worktree"], opts["number"])
+    if cmd in ("up", "refresh"):
+        if cmd == "refresh" and not sb.site_exists():
+            die(f"{name} has no sandbox yet; run `up` first")
+        sb.up(build="--no-build" not in flags, start="--no-start" not in flags, force=cmd == "refresh")
+    elif cmd == "down":
+        sb.stop()
+    elif cmd == "drop":
+        sb.drop()
+    else:
+        die(f"unknown command {cmd}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

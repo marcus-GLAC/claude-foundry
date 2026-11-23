@@ -1,0 +1,31 @@
+{
+	"app": "candy_wiki",
+	"container": "frappe_docker_devcontainer-frappe-1",
+	"host_root": "/home/marcus/frappe_docker",
+	"container_root": "/workspace",
+	"bench": "/home/marcus/frappe_docker/development/frappe-bench-preview",
+	"source_site": "preview.localhost",
+	"sandbox_root": "/home/marcus/frappe_docker/development/.factory-sandboxes",
+	"db_root_password": "123",
+	"admin_password": "admin",
+	"link_from_main": ["node_modules", "frontend/node_modules"],
+	"copy_from_main": ["candy_wiki/public/dist"],
+	"build": [
+		{ "cwd": ".", "run": "yarn tailwind:build" },
+		{ "cwd": "frontend", "run": "yarn build" }
+	],
+	"setup": "factory/sandbox_setup.py",
+	"teardown": "factory/sandbox_teardown.py",
+	"tests": {
+		"select_cmd": "python3 -I {factory}/select_tests.py",
+		"max_modules": 25
+	},
+	"e2e": {
+		"dir": "e2e/tests",
+		"cmd": "node_modules/.bin/playwright test --reporter=line",
+		"select_cmd": "python3 -I {factory}/select_tests.py --e2e",
+		"smoke": ["e2e/tests/guideline-home.spec.ts"],
+		"retries": 1,
+		"max_specs": 15
+	}
+}

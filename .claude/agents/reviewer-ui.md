@@ -56,6 +56,14 @@ never kill by process name.
 
 If the branch has no visual change, write PASS and say so.
 
+## Language
+
+The header's `Language:` is the language the human reads. Write the prose of
+review-ui.md in it: summaries, reasons, criteria, findings and questions. Keep
+exactly as this file shows them, because scripts and the dashboard read them:
+the first line, the `KEY: value` lines under it and every `##` heading. Code,
+identifiers, commands, paths, branch names stay as the repo writes them.
+
 ## Write review-ui.md
 
 ```markdown

@@ -29,7 +29,7 @@ skim a job on the dashboard and read the detail only where it matters.
 ## Pipeline
 
 ```
-intake (fable)     → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, posted as an issue comment
+intake (opus, high) → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, posted as an issue comment
 route (script)     → reviewers + models from risk/surfaces via config.json
 worktree           → factory/<job-id> from origin/main
 spec-writer (opus) → spec.md
@@ -59,8 +59,8 @@ agents reply with one line and the scripts print one line; the detail lives in
 files the next agent reads. Claude Code allows 20 concurrent subagents per
 session by default, which covers three jobs with four reviewers each.
 
-**Fable at the door, once.** Intake is the only Fable call per job. It decides
-whether the issue is worth building, rewrites the scope when the issue is too
+**A careful look at the door, once.** Intake runs once per job, on Opus at
+high effort. It decides whether the issue is worth building, rewrites the scope when the issue is too
 big or vague, and asks the author when only they can answer. Its decision goes
 on the issue as a comment; the issue body stays as written. Questions go to
 the author before a spec exists, so the spec writer never stalls on one.
@@ -142,7 +142,7 @@ break this.
 |---|---|---|
 | `/factory <feature>`, one job per session | `/factory run` drains the issue queue, `concurrency` jobs at once, one orchestrator | Alex; @spec2k5, @MrHossamsaraya |
 | Copy-paste build prompt | One install prompt pointing at this folder | @felipeclavijo1736 |
-| Every job gets all four reviewers | Fable intake rates risk and surfaces; a script routes reviewers and models | @mptrista, @Robin-ox2mz |
+| Every job gets all four reviewers | Intake rates risk and surfaces; a script routes reviewers and models | @mptrista, @Robin-ox2mz |
 | Every verdict is an LLM opinion | `checks.sh` gates before review and before merge | @Robin-ox2mz |
 | Local `git merge`, needs a clean main checkout | A PR per issue, merged with `gh pr merge` | v1 on-camera merge failures |
 | `/factory approve` | Merge the PR on GitHub | v1 |
