@@ -81,7 +81,7 @@ Các file vừa chép, theo vai trò:
 | `factory/bin/frappe-test` | chọn và chạy test Python liên quan trên phòng thử |
 | `factory/bin/frappe-e2e` | chọn và chạy test e2e Playwright liên quan trên phòng thử |
 | `factory/bin/ruff-new` | chỉ đánh trượt lỗi ruff mà branch mới tạo ra |
-| `factory/config.json` | base `version-16`, mỗi lần 1 job, các file bị khoá, ngôn ngữ báo cáo (`Vietnamese`) |
+| `factory/config.json` | base `version-16`, mỗi lần 1 job, các file bị khoá, ngôn ngữ báo cáo (`Vietnamese`), model của reviewer |
 | `factory/frappe.json` | container, site gốc, lệnh build của candy_wiki |
 | `factory/checks.sh` | các bước kiểm tra trước khi reviewer đọc |
 | `factory/sandbox_setup.py`, `sandbox_teardown.py` | tạo và xoá bản chỉ mục Qdrant riêng |
@@ -237,6 +237,10 @@ Muốn biết một job sẽ chạy những bài e2e nào, đứng trong thư m�
   cd $APP && factory/bin/frappe-sandbox down main 2>/dev/null; factory/bin/frappe-e2e baseline e2e/tests/sidebar.spec.ts
   ```
   Bỏ tên file thì nó chạy lại cả bộ, mất hơn một tiếng. Xong thì chạy lệnh dọn dẹp mà nó in ra.
+- Model: intake, spec-writer, builder và approver luôn dùng Opus. Reviewer chọn theo từng job: code dùng
+  Sonnet (rủi ro low, medium) hoặc Opus (high); giao diện có ux và ui, đều Sonnet; bảo mật dùng Opus.
+  Không agent nào dùng Haiku. Muốn đổi thì sửa `routing` và `surface_reviewers` trong
+  `factory/config.json`.
 - Phòng thử chép dữ liệu tại thời điểm tạo. Muốn dữ liệu mới hơn thì `drop` rồi `up` lại.
 - Mỗi phòng thử tốn thêm một database và khoảng 34 MB file (dùng hard link nên gần như không tốn
   thêm). Nên chạy mỗi lần 1 job (`concurrency: 1` trong `factory/config.json`) cho tới khi bạn

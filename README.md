@@ -41,7 +41,7 @@ builder (opus) → commits, pushes, opens a draft PR "Closes #n"
         ▼            ▲
 gate (script) ─FAIL──┤  factory/checks.sh; no reviewer runs on a failing build
         ▼ PASS       │
-reviewers ─CHANGES───┘  code (haiku | sonnet), + ux & ui on UI changes, + security
+reviewers ─CHANGES───┘  code (sonnet | opus), + ux & ui on UI changes, + security
         ▼ all PASS
 approver (opus) ── APPROVE  → sync with main, gate again, gh pr merge
                 └─ ESCALATE → PR ready for you, issue labeled factory:needs-human
@@ -95,7 +95,7 @@ run on the sandbox's own worker, and the sandbox is dropped when the job ends.
     reviewer-code.md          routed   correctness, simplicity, tests
     reviewer-security.md      opus     only when intake flags `security`
     reviewer-ux.md            sonnet   only when intake flags `ui`
-    reviewer-ui.md            haiku    only when intake flags `ui`
+    reviewer-ui.md            sonnet   only when intake flags `ui`
     approver.md               opus     APPROVE or ESCALATE
 factory/
   config.json                 concurrency, rounds, labels, routing, protected paths, language, prices

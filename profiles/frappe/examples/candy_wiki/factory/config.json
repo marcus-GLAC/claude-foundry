@@ -13,19 +13,19 @@
 	},
 	"routing": {
 		"low": {
-			"code": "haiku"
+			"code": "sonnet"
 		},
 		"medium": {
 			"code": "sonnet"
 		},
 		"high": {
-			"code": "sonnet"
+			"code": "opus"
 		}
 	},
 	"surface_reviewers": {
 		"ui": {
 			"ux": "sonnet",
-			"ui": "haiku"
+			"ui": "sonnet"
 		},
 		"security": {
 			"security": "opus"

@@ -10,12 +10,12 @@
     "needs_human": "factory:needs-human"
   },
   "routing": {
-    "low":    { "code": "haiku" },
+    "low":    { "code": "sonnet" },
     "medium": { "code": "sonnet" },
-    "high":   { "code": "sonnet" }
+    "high":   { "code": "opus" }
   },
   "surface_reviewers": {
-    "ui": { "ux": "sonnet", "ui": "haiku" },
+    "ui": { "ux": "sonnet", "ui": "sonnet" },
     "security": { "security": "opus" }
   },
   "protected_paths": [
