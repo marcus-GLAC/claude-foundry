@@ -37,6 +37,12 @@ CONFIG = json.loads((FACTORY / "config.json").read_text())
 LABELS = CONFIG["labels"]
 BASE = CONFIG["base_branch"]
 MARKER = "<!-- factory -->"
+# Where a job's worktree goes; {job} is its id. A Frappe app puts it in a bench-shaped sandbox
+# folder (.../<job>/apps/<app>), because its frontend build reads ../../sites like in a bench.
+WORKTREE_PATH = CONFIG.get("worktree_path", str(REPO / ".worktrees" / "{job}"))
+# Commands run when a job finishes (merged or rejected), with {job} replaced, e.g. dropping
+# a job's sandbox site. A failing hook is reported, not fatal.
+ON_FINISH = CONFIG.get("on_finish", [])
 
 TRANSITIONS = {
     "intake": {"needs-info", "rejected", "spec"},
@@ -500,6 +506,12 @@ def advance(job, stage):
     if stage in TERMINAL and Path(job["worktree"]).exists():
         run(["git", "worktree", "remove", "--force", job["worktree"]])
         run(["git", "branch", "-D", job["branch"]], check=False)
+    if stage in TERMINAL:  # after the worktree is gone: a hook may delete the folder it was in
+        for hook in ON_FINISH:
+            res = run(["bash", "-c", hook.replace("{job}", job["id"])], check=False)
+            if res.returncode != 0:
+                print(f"job: on_finish hook failed ({res.returncode}): {hook}\n{res.stderr.strip()}",
+                      file=sys.stderr)
 
     job["stage"] = stage
     job["ended"] = now() if stage in TERMINAL | WAITING else None
@@ -535,7 +547,7 @@ def cmd_create(number):
         "id": job_id, "issue": issue["number"], "title": issue["title"], "issue_url": issue["url"],
         "pr": None, "pr_url": None,
         "branch": f"factory/{job_id}",
-        "worktree": str(REPO / ".worktrees" / job_id),
+        "worktree": WORKTREE_PATH.replace("{job}", job_id),
         "stage": "intake", "round": 0, "round_limit": CONFIG["max_rounds"],
         "intake": None, "agents": None, "gate": None, "reviews": {},
         "cost_usd": 0.0, "started": now(), "ended": None,

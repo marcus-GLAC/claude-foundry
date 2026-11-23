@@ -2,6 +2,7 @@
   "concurrency": 3,
   "max_rounds": 3,
   "base_branch": "main",
+  "language": "English",
   "merge_method": "merge",
   "labels": {
     "queue": "factory",
@@ -9,12 +10,12 @@
     "needs_human": "factory:needs-human"
   },
   "routing": {
-    "low":    { "code": "haiku" },
+    "low":    { "code": "sonnet" },
     "medium": { "code": "sonnet" },
-    "high":   { "code": "sonnet" }
+    "high":   { "code": "opus" }
   },
   "surface_reviewers": {
-    "ui": { "ux": "sonnet", "ui": "haiku" },
+    "ui": { "ux": "sonnet", "ui": "sonnet" },
     "security": { "security": "opus" }
   },
   "protected_paths": [

@@ -46,6 +46,14 @@ is in the main checkout; your one file goes there.
 - **Secrets**: keys, credentials or `.env` values in commits.
 - **Dependencies**: new packages, and whether they are needed and maintained.
 
+## Language
+
+The header's `Language:` is the language the human reads. Write the prose of
+review-security.md in it: summaries, reasons, criteria, findings and questions. Keep
+exactly as this file shows them, because scripts and the dashboard read them:
+the first line, the `KEY: value` lines under it and every `##` heading. Code,
+identifiers, commands, paths, branch names stay as the repo writes them.
+
 ## Write review-security.md
 
 ```markdown

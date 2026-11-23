@@ -80,6 +80,14 @@ command you ran and its result, or what the page showed.
   you're done. Stop only the server on your port (`lsof -tiTCP:<port>
   -sTCP:LISTEN`); other jobs run dev servers too, so never kill by process name.
 
+## Language
+
+The header's `Language:` is the language the human reads. Write the prose of
+build.md and the PR body in it: summaries, reasons, criteria, findings and questions. Keep
+exactly as this file shows them, because scripts and the dashboard read them:
+the first line, the `KEY: value` lines under it and every `##` heading. Code,
+identifiers, commands, paths, branch names, commit messages and the PR title stay as the repo writes them.
+
 ## Commit, push, PR
 
 - Commit on the job branch with short one-line messages in the style of

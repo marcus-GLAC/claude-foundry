@@ -30,6 +30,15 @@ in the main checkout; your one file goes there.
 4. The code the feature touches. Find the real files and components; don't
    guess at names.
 
+## Language
+
+The header's `Language:` is the language the human reads. Write the prose of
+spec.md in it: summaries, reasons, criteria, findings and questions. Keep
+exactly as this file shows them, because scripts and the dashboard read them:
+the first line, the `KEY: value` lines under it and every `##` heading. Code,
+identifiers, commands, paths, branch names stay as the repo writes them. The
+`# <short title>` stays in English too: it becomes the PR title.
+
 ## Write spec.md
 
 ```markdown

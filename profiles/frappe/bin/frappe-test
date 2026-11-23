@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Run the Python tests a branch's changes touch, on the job's sandbox site, with the branch code.
+
+Usage (from a job's worktree, as checks.sh runs it):
+  frappe-test             pick the tests, make sure the sandbox exists and is migrated, run them
+  frappe-test --changed   only print the files the branch changed (for lint steps in checks.sh)
+  frappe-test --dry-run   only print the test modules it would run
+
+Picking: test files the branch changed; test_<name>.py next to a changed <name>.py; <app>/tests/
+test_<name>.py; the test of a changed DocType; plus whatever `tests.select_cmd` in
+factory/frappe.json prints when given the changed files on stdin ({factory} is the main
+checkout's factory/ folder, so a branch can't change how its tests are picked). No linked test: nothing runs.
+
+The sandbox is the job's (factory/bin/frappe-sandbox), so tests never touch the source site and
+jobs never share a database. Outside a job's worktree it uses a sandbox called "main".
+"""
+
+import fcntl
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+FACTORY = REPO / "factory"
+CFG = json.loads((FACTORY / "frappe.json").read_text())
+BASE = json.loads((FACTORY / "config.json").read_text())["base_branch"]
+APP = CFG["app"]
+TESTS = CFG.get("tests", {})
+SANDBOX = FACTORY / "bin" / "frappe-sandbox"
+ROOT = Path(CFG.get("sandbox_root", str(Path(CFG["bench"]).parent / ".factory-sandboxes"))) / APP
+
+
+def git(*args):
+    res = subprocess.run(["git", *args], capture_output=True, text=True)
+    return res.stdout.splitlines() if res.returncode == 0 else []
+
+
+def changed_files():
+    files = git("diff", "--name-only", f"origin/{BASE}...HEAD") + git("diff", "--name-only", "HEAD")
+    return sorted({f for f in files if Path(f).exists()})
+
+
+def module(path):
+    return str(Path(path).with_suffix("")).replace("/", ".")
+
+
+def pick(changed):
+    found = set()
+    for name in changed:
+        p = Path(name)
+        if p.suffix == ".py" and p.name.startswith("test_"):
+            found.add(name)
+        elif p.suffix == ".py":
+            for test in (p.with_name(f"test_{p.name}"), Path(APP) / "tests" / f"test_{p.name}"):
+                if test.exists():
+                    found.add(str(test))
+        doctype = re.match(r"(.+/doctype/([^/]+))/", name)
+        if doctype:
+            test = Path(doctype[1]) / f"test_{doctype[2]}.py"
+            if test.exists():
+                found.add(str(test))
+    modules = {module(f) for f in found}
+    if TESTS.get("select_cmd") and changed:
+        res = subprocess.run(TESTS["select_cmd"].replace("{factory}", str(FACTORY)), shell=True, input="\n".join(changed),
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"frappe-test: select_cmd failed: {res.stderr.strip()}")
+        modules.update(line.strip() for line in res.stdout.splitlines() if line.strip())
+    return sorted(modules)
+
+
+def job_for(cwd):
+    for job_file in (FACTORY / "jobs").glob("*/job.json"):
+        job = json.loads(job_file.read_text())
+        if Path(job["worktree"]).resolve() == cwd:
+            return job["id"], []
+    return "main", ["--worktree", str(cwd), "--number", "0"]
+
+
+def main(argv):
+    changed = changed_files()
+    if argv == ["--changed"]:
+        print("\n".join(changed))
+        return 0
+    modules = pick(changed)
+    if argv == ["--dry-run"]:
+        print("\n".join(modules) or "(no tests)")
+        return 0
+    if argv:
+        sys.exit(__doc__.strip())
+    if not modules:
+        print("frappe-test: no Python test is linked to the changed files; nothing to run")
+        return 0
+    limit = TESTS.get("max_modules", 25)
+    if len(modules) > limit:
+        print(f"frappe-test: {len(modules)} test modules (more than {limit}); this takes a while")
+    name, extra = job_for(Path.cwd().resolve())
+    (ROOT / name).mkdir(parents=True, exist_ok=True)
+    with open(ROOT / name / ".test.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # one test run per sandbox at a time
+        up = subprocess.run([sys.executable, str(SANDBOX), "up", name, *extra, "--no-build", "--no-start"])
+        if up.returncode != 0:
+            print("frappe-test: the sandbox couldn't be prepared", file=sys.stderr)
+            return 1
+        failed, ran = [], 0
+        for m in modules:
+            res = subprocess.run([sys.executable, str(SANDBOX), "frappe", name, "run-tests", "--module", m],
+                                 capture_output=True, text=True)
+            out = (res.stdout + res.stderr).splitlines()
+            ran += sum(int(l.split()[1]) for l in out if re.match(r"^Ran \d+ test", l))
+            status = "ok" if res.returncode == 0 else "FAILED"
+            print(f"  {status:<6} {m}")
+            if res.returncode != 0:
+                failed.append(m)
+                print("\n".join("    " + l for l in out[-40:]))
+    print(f"frappe-test: {len(modules)} modules, {ran} tests" + (f", failed: {', '.join(failed)}" if failed else ", all passed"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

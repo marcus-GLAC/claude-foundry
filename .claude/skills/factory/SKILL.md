@@ -21,7 +21,7 @@ tell the user; never work around it.
 ## The pipeline
 
 ```
-intake (fable)     → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, posted as an issue comment
+intake (opus, high) → ACCEPT (scope possibly changed) | NEEDS-INFO | REJECT, posted as an issue comment
 route (script)     → reviewers + models from risk/surfaces via config.json
 worktree           → factory/<job-id> from origin/<base>
 spec-writer (opus) → spec.md
@@ -76,8 +76,13 @@ run, don't poll and don't wait: end your turn with a one-line status.
 Every prompt starts with the job's header, built from `job.json`:
 
 ```
-Job: <id>. Job folder: <repo>/factory/jobs/<id>/. Main checkout: <repo>. Worktree: <worktree>. Branch: <branch>. Base: origin/<base>. Issue: #<issue>.
+Job: <id>. Job folder: <repo>/factory/jobs/<id>/. Main checkout: <repo>. Worktree: <worktree>. Branch: <branch>. Base: origin/<base>. Issue: #<issue>. Language: <language>.
 ```
+
+`<language>` is `language` in `config.json` (English when it isn't set): the
+language the human reads. The agents write their files, PR bodies and issue
+comments in it; write your own status lines, summaries and questions to the
+human in it too.
 
 `<header>` below means that line. Keep `Job folder: <path>/` exactly as shown:
 the job's cost is found by that string.

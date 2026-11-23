@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Run the browser (e2e) tests a branch's changes touch, against the job's running sandbox.
+
+Usage:
+  frappe-e2e             (from a job's worktree, as checks.sh runs it) pick the specs, bring the
+                         sandbox up with the branch code, run them
+  frappe-e2e --dry-run   only print the specs it would run
+  frappe-e2e baseline [spec...]
+                         (from anywhere) run every spec (or only these, updating just their
+                         part) on origin/<base>, in a sandbox called "base", and record which
+                         tests fail there; all of them take an hour or more. "base" is number
+                         0, like "main": stop "main" first if it runs
+
+Picking, from `e2e` in factory/frappe.json:
+  - spec files the branch changed;
+  - the spec named like a changed file: GuidelineExport.vue or guideline_export.py ->
+    guideline-export.spec.ts (and guideline-export.mobile.spec.ts);
+  - whatever `select_cmd` prints when given the changed files on stdin ({factory} is the main
+    checkout's factory/ folder, so a branch can't change how its specs are picked);
+  - `smoke`, whenever the branch changes more than docs, factory/ and .claude/ (`quiet`, a
+    regex), so the app is seen to still load.
+A branch that changes only those runs nothing.
+
+Verdict: a failing test is retried once (passing then = flaky, not a failure). A test that still
+fails fails the step, unless the baseline (<sandbox root>/<app>/e2e-baseline.json) says it
+fails on the base branch too: like ruff-new, the branch answers only for what it breaks.
+
+The specs run on the host, from the worktree, with `cmd` (Playwright), against the sandbox:
+BASE_URL is its address, FRAPPE_SITE its site, FRAPPE_USER/FRAPPE_PASSWORD its login. Traces
+and failure screenshots go to the sandbox folder, the whole output to its logs/e2e.log.
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+FACTORY = REPO / "factory"
+CFG = json.loads((FACTORY / "frappe.json").read_text())
+BASE = json.loads((FACTORY / "config.json").read_text())["base_branch"]
+APP = CFG["app"]
+E2E = CFG.get("e2e", {})
+SPEC_DIR = E2E.get("dir", "e2e/tests")
+SPEC_RE = re.compile(r"\.spec\.(ts|js|mjs)$")
+# changes that can't break the running app: docs, the factory itself, agent instructions
+QUIET_RE = re.compile(E2E.get("quiet", r"^(docs/|factory/|\.claude/|\.github/|LICENSE)|\.md$|^\.gitignore$"))
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+SANDBOX = FACTORY / "bin" / "frappe-sandbox"
+ROOT = Path(CFG.get("sandbox_root", str(Path(CFG["bench"]).parent / ".factory-sandboxes"))) / APP
+BASELINE = ROOT / "e2e-baseline.json"
+
+
+def git(*args, cwd=None):
+    res = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    return res.stdout.splitlines() if res.returncode == 0 else []
+
+
+def changed_files():
+    files = git("diff", "--name-only", f"origin/{BASE}...HEAD") + git("diff", "--name-only", "HEAD")
+    return sorted({f for f in files if Path(f).exists()})
+
+
+def all_specs():
+    return sorted(str(p) for p in Path(SPEC_DIR).glob("*") if SPEC_RE.search(p.name)) if Path(SPEC_DIR).is_dir() else []
+
+
+def kebab(stem):
+    """GuidelineExport / guideline_export / guidelineExport -> guideline-export."""
+    stem = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", stem)
+    return re.sub(r"[_\s]+", "-", stem).lower()
+
+
+def pick(changed):
+    specs = all_specs()
+    by_name = {}
+    for spec in specs:
+        by_name.setdefault(SPEC_RE.sub("", Path(spec).name).removesuffix(".mobile"), []).append(spec)
+    found = set()
+    for name in changed:
+        p = Path(name)
+        if SPEC_RE.search(p.name):
+            if name in specs:
+                found.add(name)
+            continue
+        found.update(by_name.get(kebab(p.stem), []))
+    if E2E.get("select_cmd") and changed:
+        res = subprocess.run(E2E["select_cmd"].replace("{factory}", str(FACTORY)), shell=True,
+                             input="\n".join(changed), capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"frappe-e2e: select_cmd failed: {res.stderr.strip()}")
+        found.update(line.strip() for line in res.stdout.splitlines() if line.strip() in specs)
+    if any(not QUIET_RE.search(f) for f in changed):
+        found.update(s for s in E2E.get("smoke", []) if s in specs)
+    return sorted(found)
+
+
+def job_for(cwd):
+    for job_file in (FACTORY / "jobs").glob("*/job.json"):
+        job = json.loads(job_file.read_text())
+        if Path(job["worktree"]).resolve() == cwd:
+            return job["id"], []
+    return "main", ["--worktree", str(cwd), "--number", "0"]
+
+
+# ---- Running and reading Playwright's report --------------------------------
+
+
+def results(report):
+    """{test id: status} from Playwright's JSON report; status is expected, unexpected, flaky or skipped."""
+    out = {}
+
+    def walk(suite, path, file):
+        file = suite.get("file", file)
+        if suite.get("title") and suite.get("title") != file:
+            path = [*path, suite["title"]]
+        for spec in suite.get("specs", []):
+            for test in spec.get("tests", []):
+                key = " › ".join([test.get("projectName", ""), spec.get("file", file), *path, spec["title"]])
+                out[key] = test.get("status")
+        for child in suite.get("suites", []):
+            walk(child, path, file)
+
+    for suite in report.get("suites", []):
+        walk(suite, [], suite.get("file"))
+    return out
+
+
+def run_specs(name, extra, specs, retries):
+    """Bring the sandbox up and run the specs against it (all of them when none are given)."""
+    (ROOT / name).mkdir(parents=True, exist_ok=True)
+    with open(ROOT / name / ".test.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # not while frappe-test uses the same sandbox
+        up = subprocess.run([sys.executable, str(SANDBOX), "up", name, *extra])
+        if up.returncode != 0:
+            sys.exit("frappe-e2e: the sandbox couldn't be brought up")
+        state = json.loads((ROOT / name / "state.json").read_text())
+        outdir = ROOT / name / "e2e-results"
+        logs = ROOT / name / "logs"
+        logs.mkdir(exist_ok=True)
+        report, log = logs / "e2e.json", logs / "e2e.log"
+        report.unlink(missing_ok=True)
+        env = {k: v for k, v in os.environ.items() if k != "CI"}  # CI switches the reporter and retries
+        env.update(
+            FORCE_COLOR="0", NO_COLOR="1", PLAYWRIGHT_JSON_OUTPUT_NAME=str(report),
+            BASE_URL=f"http://127.0.0.1:{state['port']}",  # Node can't resolve *.localhost; the server serves one site anyway
+            FRAPPE_SITE=state["site"],
+            FRAPPE_USER=state["login"]["user"],
+            FRAPPE_PASSWORD=state["login"]["password"],
+        )
+        cmd = E2E.get("cmd", "node_modules/.bin/playwright test")
+        print(f"frappe-e2e: {len(specs) or 'all'} spec(s) on {state['url']}", flush=True)
+        res = subprocess.run(f"{cmd} --reporter=line,json --retries={retries} --output {outdir} " + " ".join(specs),
+                             shell=True, env=env, capture_output=True, text=True)
+    log.write_text(ANSI_RE.sub("", res.stdout + res.stderr))
+    if not report.exists():
+        print("\n".join(log.read_text().splitlines()[-40:]))
+        sys.exit(f"frappe-e2e: Playwright wrote no report (exit {res.returncode}); see {log}")
+    return results(json.loads(report.read_text())), log, outdir
+
+
+def spec_of(test_id):
+    return test_id.split(" › ")[1]
+
+
+def write_baseline(got, commit, partial=False):
+    """Record the failing tests; a partial run replaces only the entries of the spec files it ran."""
+    failing = {t for t, s in got.items() if s == "unexpected"}
+    total = len(got)
+    if partial and BASELINE.exists():
+        old = json.loads(BASELINE.read_text())
+        ran = {spec_of(t) for t in got}
+        failing |= {t for t in old["failing"] if spec_of(t) not in ran}
+        total = old.get("tests", total)
+    BASELINE.write_text(json.dumps({"branch": BASE, "commit": commit, "date": time.strftime("%Y-%m-%d"),
+                                    "tests": total, "failing": sorted(failing)}, indent=1) + "\n")
+    print(f"frappe-e2e: baseline of {BASE} at {commit[:8]}: {len(failing)} failing tests recorded"
+          f"{f' ({len(got)} run now)' if partial else f' of {total}'}; written to {BASELINE}")
+
+
+def baseline(specs):
+    worktree = ROOT / "base" / "apps" / APP  # bench-shaped, like a job's
+    subprocess.run(["git", "fetch", "-q", "origin", BASE], cwd=REPO, check=True)
+    if worktree.exists():
+        subprocess.run(["git", "checkout", "-q", "--detach", f"origin/{BASE}"], cwd=worktree, check=True)
+    else:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "worktree", "add", "-q", "--detach", str(worktree), f"origin/{BASE}"],
+                       cwd=REPO, check=True)
+    for rel in CFG.get("link_from_main", []):  # the specs run on the host and need node_modules
+        if not (worktree / rel).exists() and (REPO / rel).exists():
+            (worktree / rel).symlink_to(os.path.relpath(REPO / rel, (worktree / rel).parent))
+    os.chdir(worktree)
+    got, _, _ = run_specs("base", ["--worktree", str(worktree), "--number", "0"], specs, retries=1)
+    write_baseline(got, git("rev-parse", "HEAD")[0], partial=bool(specs))
+    print(f"Then free the space: {SANDBOX} drop base && git -C {REPO} worktree remove --force {worktree}")
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["baseline"]:
+        return baseline(argv[1:])
+    specs = pick(changed_files())
+    if argv == ["--dry-run"]:
+        print("\n".join(specs) or "(no specs)")
+        return 0
+    if argv:
+        sys.exit(__doc__.strip())
+    if not specs:
+        print("frappe-e2e: no e2e spec is linked to the changed files; nothing to run")
+        return 0
+    limit = E2E.get("max_specs", 15)
+    if len(specs) > limit:
+        print(f"frappe-e2e: {len(specs)} specs (more than {limit}); this takes a while")
+    name, extra = job_for(Path.cwd().resolve())
+    got, log, outdir = run_specs(name, extra, specs, retries=E2E.get("retries", 1))
+    base = json.loads(BASELINE.read_text()) if BASELINE.exists() else {}
+    known = set(base.get("failing", []))
+    failed = [t for t, s in got.items() if s == "unexpected"]
+    new = [t for t in failed if t not in known]
+    old = [t for t in failed if t in known]
+    count = {s: sum(1 for v in got.values() if v == s) for s in ("expected", "flaky", "skipped")}
+    print(f"frappe-e2e: {len(got)} tests: {count['expected']} passed, {count['flaky']} flaky, "
+          f"{count['skipped']} skipped, {len(failed)} failed")
+    if old:
+        print(f"  {len(old)} of them fail on {BASE} too (baseline {base.get('date')}, {base.get('commit', '')[:8]}), "
+              "so they don't count against this branch:")
+        print("\n".join(f"    - {t}" for t in old))
+    if new:
+        print(f"  FAILED here, and not known to fail on {BASE}"
+              f"{'' if base else ' (there is no baseline yet: frappe-e2e baseline)'}:")
+        print("\n".join(f"    - {t}" for t in new))
+        errors = [l for l in log.read_text().splitlines() if re.match(r"^\s*(Error:|TimeoutError:|Error Context:)", l)]
+        print("  Errors in the log (every failing test, each try):")
+        print("\n".join("    " + l.strip()[:300] for l in errors[:40]))
+        print(f"frappe-e2e: full output in {log}; traces and screenshots in {outdir}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

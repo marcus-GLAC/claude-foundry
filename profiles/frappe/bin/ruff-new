@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Fail only on ruff findings the branch adds, in the Python files it changed.
+
+Usage (from a job's worktree): ruff-new [--ruff ruff@0.8.1]
+
+It runs `ruff check` on each changed file as the branch has it and as origin/<base> has it, with
+the branch's ruff config, and compares the findings by file, rule and message (not line, which
+shifts). An old finding in a touched file doesn't fail the job; a new one does. `ruff format
+--check` runs on the changed files as they are: formatting is whole-file and cheap to fix.
+"""
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+BASE = json.loads((REPO / "factory" / "config.json").read_text())["base_branch"]
+CONFIGS = ("pyproject.toml", "ruff.toml", ".ruff.toml")
+
+
+def git(*args, check=True):
+    res = subprocess.run(["git", *args], capture_output=True, text=True)
+    if check and res.returncode != 0:
+        sys.exit(f"ruff-new: git {' '.join(args)} failed: {res.stderr.strip()}")
+    return res
+
+
+def findings(ruff, root, files):
+    if not files:
+        return Counter(), []
+    res = subprocess.run(["uvx", ruff, "check", "--output-format", "json", "--no-cache", *files],
+                         cwd=root, capture_output=True, text=True)
+    if res.returncode not in (0, 1):
+        sys.exit(f"ruff-new: ruff failed: {res.stderr.strip()}")
+    items = json.loads(res.stdout or "[]")
+    for item in items:
+        item["filename"] = str(Path(item["filename"]).resolve().relative_to(Path(root).resolve()))
+    return Counter((i["filename"], i["code"], i["message"]) for i in items), items
+
+
+def main(argv):
+    ruff = argv[argv.index("--ruff") + 1] if "--ruff" in argv else "ruff@0.8.1"
+    names = git("diff", "--name-only", f"origin/{BASE}...HEAD").stdout.splitlines()
+    names += git("diff", "--name-only", "HEAD").stdout.splitlines()
+    changed = sorted({n for n in names if n.endswith(".py") and Path(n).exists()})
+    if not changed:
+        print("ruff-new: no Python files changed")
+        return 0
+    now, items = findings(ruff, ".", changed)
+    with tempfile.TemporaryDirectory() as old_root:
+        for cfg in CONFIGS:
+            if Path(cfg).exists():
+                shutil.copy(cfg, Path(old_root) / cfg)
+        old_files = []
+        for name in changed:
+            blob = git("show", f"origin/{BASE}:{name}", check=False)
+            if blob.returncode == 0:
+                (Path(old_root) / name).parent.mkdir(parents=True, exist_ok=True)
+                (Path(old_root) / name).write_text(blob.stdout)
+                old_files.append(name)
+        before, _ = findings(ruff, old_root, old_files)
+    added = now - before
+    status = 0
+    if added:
+        status = 1
+        print(f"ruff-new: {sum(added.values())} new finding(s) in the changed files:")
+        for item in items:
+            key = (item["filename"], item["code"], item["message"])
+            if added[key] > 0:
+                added[key] -= 1
+                loc = item["location"]
+                print(f"  {item['filename']}:{loc['row']}:{loc['column']}: {item['code']} {item['message']}")
+    else:
+        print(f"ruff-new: no new findings in {len(changed)} changed file(s)"
+              + (f" ({sum(before.values())} old ones left alone)" if before else ""))
+    fmt = subprocess.run(["uvx", ruff, "format", "--check", "--quiet", *changed])
+    return status or fmt.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
